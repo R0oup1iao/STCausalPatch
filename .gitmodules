@@ -1,0 +1,6 @@
+[submodule "external/PatchSTG"]
+	path = external/PatchSTG
+	url = https://github.com/LMissher/PatchSTG
+[submodule "external/UNN"]
+	path = external/UNN
+	url = https://github.com/jarrycyx/UNN
