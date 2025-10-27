@@ -1,0 +1,74 @@
+# STCP/configs/stcp_lorenz.yaml
+# (已修复: 添加 loss_null_val)
+
+project_name: "STCP_Lorenz_Test"
+log_dir: "./logs"
+model_save_path: "./saved_models/stcp_lorenz_best.pth"
+mode: "train"
+
+data:
+  dataset_type: "synthetic" 
+  
+  input_len: 10
+  output_len: 1
+  train_ratio: 0.6
+  val_ratio: 0.2
+  test_ratio: 0.2
+  input_dim: 1
+
+synthetic:
+  data_type: "lorenz"
+  n_nodes: 20       
+  num_steps_after_burn_in: 5000   
+  num_steps_burn_in: 1000         
+  var_p: 2          
+  spatial_layout: "ring" 
+
+spatial:
+  initial_depth: 1    
+  final_depth: 5      
+  schedule_type: "linear"
+  
+model:
+  n_nodes: 20         
+  embed_dim: 32
+  
+  use_spatial_emb: True
+  use_temporal_emb: False 
+
+  node_emb_dim: 8
+  tod_size: 288         
+  tod_emb_dim: 1
+  dow_size: 7
+  dow_emb_dim: 1
+  
+  num_layers: 2
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attn_dropout: 0.1
+
+training:
+  seed: 42
+  device: "cuda:0"
+  batch_size: 64
+  max_epoch: 100
+  
+  #!#!#! 修复 Bug 2: 
+  loss_null_val: "None" # 
+  
+  lr_data_start: 0.001
+  weight_decay_data: 0.0001
+  lr_data_milestones: [50, 80]
+  lr_data_gamma: 0.1
+
+  lr_graph_start: 0.01
+  weight_decay_graph: 0.0
+  lr_graph_milestones: [50, 80]
+  lr_graph_gamma: 0.1
+  
+causal:
+  lambda_s_start: 0.1
+  lambda_s_end: 0.01
+  tau_start: 1.0
+  tau_end: 0.1

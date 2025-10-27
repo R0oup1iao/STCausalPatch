@@ -1,0 +1,69 @@
+# STCP/configs/stcp_real_world.yaml
+# (已修复: 添加 loss_null_val)
+
+project_name: "STCP_SD_Test"
+log_dir: "./logs"
+model_save_path: "./saved_models/stcp_SD_best.pth"
+mode: "train" 
+
+data:
+  dataset_type: "real_world" 
+  
+  traffic_file: "./data/SD/flowsd.npz"
+  meta_file: "./data/SD/sd_meta.csv" 
+
+  input_len: 12
+  output_len: 12
+  train_ratio: 0.7
+  val_ratio: 0.1
+  test_ratio: 0.2
+  input_dim: 1
+
+spatial:
+  initial_depth: 2
+  final_depth: 8      
+  schedule_type: "linear"
+
+model:
+  n_nodes: 716        
+  embed_dim: 64
+  
+  use_spatial_emb: True
+  use_temporal_emb: True
+  
+  node_emb_dim: 16
+  tod_size: 288       
+  tod_emb_dim: 8
+  dow_size: 7
+  dow_emb_dim: 8
+  
+  num_layers: 3
+  num_heads: 4
+  mlp_ratio: 4.0
+  dropout: 0.1
+  attn_dropout: 0.1
+
+training:
+  seed: 42
+  device: "cuda:0" 
+  batch_size: 32
+  max_epoch: 100
+  
+  #!#!#! 修复 Bug 2: 
+  loss_null_val: 0.0 # 
+  
+  lr_data_start: 0.001
+  weight_decay_data: 0.0001
+  lr_data_milestones: [1, 35, 40]
+  lr_data_gamma: 0.5
+
+  lr_graph_start: 0.01
+  weight_decay_graph: 0.0
+  lr_graph_milestones: [1, 35, 40]
+  lr_graph_gamma: 0.5
+  
+causal:
+  lambda_s_start: 1.0
+  lambda_s_end: 0.01
+  tau_start: 1.0
+  tau_end: 0.1
