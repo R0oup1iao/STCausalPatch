@@ -1,0 +1,83 @@
+# config/config.yaml (已修复并简化)
+
+# 1. 训练器配置
+trainer:
+  max_epochs: 40
+  accelerator: "gpu" # "gpu", "cpu", "mps"
+  devices: 1
+  check_val_every_n_epoch: 5
+  # (Pytorch Lightning 会自动从 checkpoint 加载)
+
+# 2. 数据配置 (用于 DataModule 和模型)
+data:
+  # --- 数据源控制 ---
+  # source: 'file' 或 'simulate'
+  source: 'simulate'
+
+  # --- 选项1: 从文件加载 (如果 source: 'file') ---
+  file:
+    data_path: "./data/example_data.npy"
+    mask_path: "./data/example_mask.npy"
+
+  # --- 选项2: 动态模拟 (如果 source: 'simulate') ---
+  simulation:
+    # 对应 data/simu_data.py 中的函数名
+    name: 'simulate_lorenz_96' 
+    params:
+      p: 128
+      T: 1000
+      F: 10.0
+      delta_t: 0.1
+      sd: 0.1
+      burn_in: 1000
+      seed: 42
+
+  # --- 掩码生成 (仅在 'simulate' 模式下使用) ---
+  missing:
+    seed: 42
+    params:
+      p_block: 0.0  # 对应 p_block
+      p_noise: 0.0   # 对应 p_noise
+      max_seq: 10    # 对应 max_seq
+      min_seq: 1     # 对应 min_seq
+
+  # --- 通用 DataModule 参数 ---
+  n_nodes: 128          # 必须！改为你的节点数
+  data_dim: 1          # 必须！改为你的特征维度
+  input_step: 10
+  pred_step: 1         # 重要：原模型只支持 pred_step=1
+  batch_size: 64
+  num_workers: 0
+  block_size: null
+
+# 3. 预测模型配置 (用于 CUTSModel)
+model:
+  embed_dim: 64              # (E) 统一的嵌入维度 (MLP输出 和 Transformer输入)
+  temporal_mlp_hidden: 128   # TemporalMLP 的 *中间* 隐藏层
+  
+  spatial_n_heads: 1
+  spatial_ffn_dim: 128       # Transformer FFN
+  spatial_n_layers: 2
+  
+  prediction_head_hidden: 64 # 预测头的隐藏维度
+
+# 4. 优化器配置
+optimizer:
+  data_pred: # 预测模型优化器
+    lr_data_start: 0.001
+    lr_data_end: 0.0001
+    weight_decay: 0.0001
+  graph_discov: # 因果图优化器
+    lr_graph_start: 0.01
+    lr_graph_end: 0.001
+
+# 5. 因果发现配置 (用于 CausalGraphLearner)
+causal:
+  n_groups_start: 8  # 初始 G 矩阵的组数 (如果 group_policy=None, 设为 n_nodes)
+  group_policy: "mul_2_every_10" # e.g., "mul_2_every_10" or "None"
+  
+  start_tau: 1.0
+  end_tau: 0.1
+  
+  lambda_s_start: 0.1
+  lambda_s_end: 0.1

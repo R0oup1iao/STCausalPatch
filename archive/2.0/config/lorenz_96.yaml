@@ -1,0 +1,82 @@
+# config/lorenz_96.yaml
+# 这是一个更稳定、接近原始 lorenz_example.yaml 的配置
+
+# 1. 训练器配置
+trainer:
+  max_epochs: 64         # 原始: total_epoch: 64
+  accelerator: "gpu"
+  devices: 1
+  check_val_every_n_epoch: 5
+
+# 2. 数据配置 (用于 DataModule 和模型)
+data:
+  # --- 数据源控制 ---
+  source: 'simulate'
+
+  # --- 选项1: 从文件加载 (如果 source: 'file') ---
+  file:
+    data_path: "./data/example_data.npy"
+    mask_path: "./data/example_mask.npy"
+
+  # --- 选项2: 动态模拟 (如果 source: 'simulate') ---
+  simulation:
+    name: 'simulate_lorenz_96' 
+    params:
+      p: 128             # 原始: p: 128
+      T: 1000            # 原始: T: 1000
+      seed: 0            # 原始: seed: 0
+      # (F, delta_t, sd, burn_in 使用 simu_data.py 默认值)
+      F: 10.0
+      delta_t: 0.1
+      sd: 0.1
+      burn_in: 1000
+
+  # --- 掩码生成 (仅在 'simulate' 模式下使用) ---
+  missing:
+    seed: 0              # 原始: seed: 0
+    params:
+      p_block: 0.0       # 原始: p_block: 0
+      p_noise: 0.3       # 原始: p_noise: 0.3
+      max_seq: 48        # 原始: max_seq: 48
+      min_seq: 12        # 原始: min_seq: 12
+
+  # --- 通用 DataModule 参数 ---
+  n_nodes: 128           # 必须匹配 simulation.params.p
+  data_dim: 1            # 原始: data_dim: 1
+  input_step: 10         # 原始: input_step: 1
+                         # !!! 注意: 原始模型是 GRU, input_step=1
+                         # 我们的模型是 MLP, input_step=10 是更合理的选择
+                         # 如果 input_step=1, TemporalEncoder 几乎没用
+  pred_step: 1           
+  batch_size: 128        # 原始: batch_size: 128
+  num_workers: 0         # (保持 0 以避免崩溃)
+
+# 3. 预测模型配置 (用于 CUTSModel)
+model:
+  embed_dim: 64              # (H_t + E)
+  temporal_mlp_hidden: 128   # (MLP 中间层)
+  spatial_n_heads: 4         
+  spatial_ffn_dim: 128       
+  spatial_n_layers: 2
+  prediction_head_hidden: 64 
+
+# 4. 优化器配置 (!!! 关键修复 !!!)
+optimizer:
+  data_pred: # 预测模型优化器
+    lr_data_start: 0.01      # 原始: 1e-2
+    lr_data_end: 0.001       # 原始: 1e-3
+    weight_decay: 0.0        # 原始: 0
+  graph_discov: # 因果图优化器
+    lr_graph_start: 0.001    # 原始: 1e-3 (!!! 修复: 之前是 0.01)
+    lr_graph_end: 0.0001     # 原始: 1e-4 (!!! 修复: 之前是 0.001)
+
+# 5. 因果发现配置 (用于 CausalGraphLearner)
+causal:
+  n_groups_start: 32           # 原始: n_groups: 32
+  group_policy: "mul_2_every_20" # 原始: multiply_2_every_20
+  
+  start_tau: 1.0
+  end_tau: 0.1
+  
+  lambda_s_start: 0.1          # 原始: 1e-1
+  lambda_s_end: 0.01           # 原始: 1e-2 (!!! 修复: 之前是 0.1)

@@ -1,3 +1,5 @@
+import numpy as np
+from sklearn.metrics import roc_auc_score, average_precision_score
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -27,7 +29,7 @@ class CUTSPlusLightning(pl.LightningModule):
             n_groups=self.cfg_causal.get("n_groups_start"),
             group_policy=self.cfg_causal.get("group_policy"),
             gumbel_tau_start=self.cfg_causal.get("start_tau")
-        )
+        ).to(self.device)
         
         # 3. Loss (与原代码一致)
         self.data_pred_loss = nn.MSELoss(reduction='sum') # 使用 sum，然后手动除以 mask 均值
@@ -65,9 +67,6 @@ class CUTSPlusLightning(pl.LightningModule):
         
         # (N, N)
         effective_adj = self.causal_learner.get_effective_adj_matrix()
-
-        # --- 优化器 0: 数据预测 (latent_data_pred) ---
-        # 移植自 'cuts_plus.py' (lines 160-184)
         
         # (B, N, N)
         graph_sampled_pred = self.causal_learner.sample_graph(
@@ -84,7 +83,7 @@ class CUTSPlusLightning(pl.LightningModule):
         self.manual_backward(loss_pred)
         opt_model.step()
         
-        self.log('train/pred_loss', loss_pred, on_step=True, on_epoch=True, prog_bar=True)
+        # self.log('train/pred_loss', loss_pred, on_step=True, on_epoch=True, prog_bar=True)
         
         # --- 优化器 1: 因果图发现 (graph_discov) ---
         # 移植自 'cuts_plus.py' (lines 186-210)
@@ -111,12 +110,16 @@ class CUTSPlusLightning(pl.LightningModule):
         self.manual_backward(loss_graph_total)
         opt_graph.step()
         
-        self.log_dict({
-            'train/graph_total_loss': loss_graph_total,
-            'train/graph_data_loss': loss_data,
-            'train/graph_sparsity_loss': loss_sparsity,
-            'params/lambda_s': self.lambda_s
-        }, on_step=True, on_epoch=True)
+        # (替换 log_dict 为单独的 log, 以便控制 prog_bar)
+
+        # 总损失 (不显示在进度条)
+        # self.log('train/graph_total_loss', loss_graph_total, on_step=True, on_epoch=True, logger=True)
+        # S2 Loss (显示在进度条)
+        self.log('S2_loss', loss_data, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # Sparsity (显示在进度条)
+        self.log('Sparsity', loss_sparsity, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        # Lambda (不显示在进度条)
+        # self.log('params/lambda_s', self.lambda_s, on_step=True, on_epoch=False, logger=True)
 
     def on_train_epoch_end(self):
         """
@@ -135,7 +138,9 @@ class CUTSPlusLightning(pl.LightningModule):
         if self.causal_learner.update_groups(self.current_epoch):
             # 如果 G 更新了，GT (learnable_grouped_adj) 也被替换了
             # 我们需要重置图优化器
-            self.needs_optimizer_reset = True
+            # self.needs_optimizer_reset = True
+            print(f"Epoch {self.current_epoch}: G/GT updated. Resetting optimizers.")
+            self.trainer.strategy.setup_optimizers(self.trainer)
 
     def configure_optimizers(self):
         """
@@ -166,35 +171,35 @@ class CUTSPlusLightning(pl.LightningModule):
         
         return [opt_model, opt_graph], [sched1, sched2]
 
-    def on_before_optimizer_step(self, optimizer, optimizer_idx):
-        """
-        在图优化器步骤之前，检查是否需要重置它
-        """
-        if optimizer_idx == 1 and self.needs_optimizer_reset:
-            print(f"Epoch {self.current_epoch}: Resetting graph optimizer due to group update.")
-            opt_graph = self.optimizers()[1]
+    # def on_before_optimizer_step(self, optimizer, optimizer_idx):
+    #     """
+    #     在图优化器步骤之前，检查是否需要重置它
+    #     """
+    #     if optimizer_idx == 1 and self.needs_optimizer_reset:
+    #         print(f"Epoch {self.current_epoch}: Resetting graph optimizer due to group update.")
+    #         opt_graph = self.optimizers()[1]
             
-            # 重新创建优化器
-            new_opt_graph = torch.optim.Adam(
-                self.causal_learner.parameters(),
-                lr=self.cfg_optim.graph_discov.lr_graph_start # 重置学习率
-            )
-            opt_graph.load_state_dict(new_opt_graph.state_dict())
+    #         # 重新创建优化器
+    #         new_opt_graph = torch.optim.Adam(
+    #             self.causal_learner.parameters(),
+    #             lr=self.cfg_optim.graph_discov.lr_graph_start # 重置学习率
+    #         )
+    #         opt_graph.load_state_dict(new_opt_graph.state_dict())
             
-            # 重新创建调度器
-            gamma2 = (self.cfg_optim.graph_discov.lr_graph_end / 
-                      self.cfg_optim.graph_discov.lr_graph_start) ** (1.0 / self.hparams.trainer.max_epochs)
+    #         # 重新创建调度器
+    #         gamma2 = (self.cfg_optim.graph_discov.lr_graph_end / 
+    #                   self.cfg_optim.graph_discov.lr_graph_start) ** (1.0 / self.hparams.trainer.max_epochs)
             
-            # 让调度器从当前 gamma 开始
-            # 我们需要手动计算当前 epoch 对应的 gamma
-            current_gamma = gamma2 ** self.current_epoch 
-            new_sched_graph = torch.optim.lr_scheduler.StepLR(opt_graph, step_size=1, gamma=gamma2)
-            # 设置调度器的 last_epoch 来同步
-            new_sched_graph.last_epoch = self.current_epoch 
+    #         # 让调度器从当前 gamma 开始
+    #         # 我们需要手动计算当前 epoch 对应的 gamma
+    #         current_gamma = gamma2 ** self.current_epoch 
+    #         new_sched_graph = torch.optim.lr_scheduler.StepLR(opt_graph, step_size=1, gamma=gamma2)
+    #         # 设置调度器的 last_epoch 来同步
+    #         new_sched_graph.last_epoch = self.current_epoch 
             
-            self.lr_schedulers()[1].load_state_dict(new_sched_graph.state_dict())
+    #         self.lr_schedulers()[1].load_state_dict(new_sched_graph.state_dict())
             
-            self.needs_optimizer_reset = False
+    #         self.needs_optimizer_reset = False
             
     # 你可以在这里添加 validation_step 来计算 AUC 等指标
     def validation_step(self, batch, batch_idx):
@@ -213,3 +218,50 @@ class CUTSPlusLightning(pl.LightningModule):
         loss_val = self._calculate_loss(y_pred, y, mask_y)
         self.log('val/pred_loss', loss_val, prog_bar=True)
         return loss_val
+    
+    def on_validation_epoch_end(self):
+        """
+        在验证 epoch 结束后计算并记录 AUC 和 AUPRC
+        """
+        # 1. 检查 DataModule 是否有 ground truth
+        datamodule = self.trainer.datamodule
+        if not hasattr(datamodule, 'true_cm') or datamodule.true_cm is None:
+            print("未找到 true_cm, 跳过 AUC 计算")
+            return
+
+        true_cm = datamodule.true_cm
+
+        # 确保 true_cm 是 numpy 数组
+        if isinstance(true_cm, torch.Tensor):
+            true_cm = true_cm.cpu().numpy()
+
+        # 2. 获取当前学到的图
+        # (N, N)
+        discovered_graph = self.causal_learner.get_effective_adj_matrix().detach().cpu().numpy()
+
+        # 3. 准备计算
+        # (N, N) -> (N*N,)
+        # 我们需要跳过对角线 (自环)
+        n_nodes = discovered_graph.shape[0]
+        mask = ~np.eye(n_nodes, dtype=bool) # 掩码，排除对角线
+
+        true_flat = true_cm[mask]
+        pred_flat = discovered_graph[mask]
+
+        if len(np.unique(true_flat)) < 2:
+            # 真实图全 0 (或全 1)，无法计算 AUC
+            # print("真实图中标签少于2类, 跳过 AUC 计算")
+            return
+
+        # 4. 计算并记录指标
+        try:
+            auc = roc_auc_score(true_flat, pred_flat)
+            auprc = average_precision_score(true_flat, pred_flat)
+
+            # (!!!) 记录到进度条
+            self.log('val/AUC', auc, prog_bar=True, logger=True)
+            self.log('val/AUPRC', auprc, prog_bar=True, logger=True)
+
+        except ValueError as e:
+            print(f"计算 AUC/AUPRC 时出错: {e}")
+            pass
