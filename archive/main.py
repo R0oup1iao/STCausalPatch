@@ -70,7 +70,7 @@ def run(config, log_f):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default="configs/stcp_real_world.yaml", help='configuration file')
+    parser.add_argument("--config", type=str, default="configs/stcp_lorenz.yaml", help='configuration file')
     args = parser.parse_args()
 
     # 

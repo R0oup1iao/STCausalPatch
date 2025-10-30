@@ -1,5 +1,6 @@
 # STCP/utils/data_loader.py
-# (已修改以适应 synthetic_data.py 中的变量重命名)
+# (已修复 Bug: 归一化逻辑)
+# (已修复 Log: 澄清 4D 形状)
 
 import torch
 import numpy as np
@@ -8,7 +9,7 @@ from .spatial import read_meta
 from .synthetic_data import generate_synthetic_data
 from .logging import log_string
 
-# === 代码复制自: lmissher/patchstg/PatchSTG-feb68c369ac51fee2e730c2d27393bb9103c8a8c/lib/utils.py ===
+# === seq2instance (无变化) ===
 def seq2instance(data, P, Q):
     """
     将时序数据转换为 (X, Y) 样本对。
@@ -22,17 +23,15 @@ def seq2instance(data, P, Q):
         y[i] = data[i + P : i + P + Q]
     return x, y
 
-# === 重构: 逻辑改编自 PatchSTG/lib/utils.py 中的 loadData ===
+# === _load_real_world_dataset (无变化) ===
 def _load_real_world_dataset(config_data, config_model, log_f):
     """
     加载真实世界时空数据集。
     """
-    # 
     Traffic = np.load(config_data.traffic_file)['data'][..., :config_data.input_dim]
     locations = read_meta(config_data.meta_file)
     num_step, num_nodes = Traffic.shape[0], Traffic.shape[1]
     
-    # 
     tod = config_model.tod_size
     dow = config_model.dow_size
     TE = np.zeros([num_step, 2])
@@ -43,7 +42,6 @@ def _load_real_world_dataset(config_data, config_model, log_f):
     log_string(log_f, f'Shape of data: {Traffic.shape}')
     log_string(log_f, f'Shape of locations: {locations.shape}')
 
-    # 
     train_steps = round(config_data.train_ratio * num_step)
     val_steps = round(config_data.val_ratio * num_step)
     test_steps = num_step - train_steps - val_steps
@@ -52,7 +50,6 @@ def _load_real_world_dataset(config_data, config_model, log_f):
     valData, valTE = Traffic[train_steps : train_steps + val_steps], TE_tile[train_steps : train_steps + val_steps]
     testData, testTE = Traffic[-test_steps :], TE_tile[-test_steps :]
 
-    # X, Y 
     P, Q = config_data.input_len, config_data.output_len
     trainX, trainY = seq2instance(trainData, P, Q)
     valX, valY = seq2instance(valData, P, Q)
@@ -65,10 +62,13 @@ def _load_real_world_dataset(config_data, config_model, log_f):
     # 
     mean, std = np.mean(trainX), np.std(trainX)
 
-    log_string(log_f, f'Shape of Train: {trainY.shape}')
-    log_string(log_f, f'Shape of Validation: {valY.shape}')
-    log_string(log_f, f'Shape of Test: {testY.shape}')
-    log_string(log_f, f'Mean: {mean} & Std: {std}')
+    #!#!#! 修复: 澄清日志输出
+    log_string(log_f, "Data shapes (Samples, Time, Nodes, Features):")
+    log_string(log_f, f'Shape of Train X (P={P}): {trainX.shape}')
+    log_string(log_f, f'Shape of Train Y (Q={Q}): {trainY.shape}')
+    log_string(log_f, f'Shape of Validation Y (Q={Q}): {valY.shape}')
+    log_string(log_f, f'Shape of Test Y (Q={Q}): {testY.shape}')
+    log_string(log_f, f'Mean (Train X): {mean} & Std (Train X): {std}')
 
     dataset_pack = {
         'data': {
@@ -83,7 +83,7 @@ def _load_real_world_dataset(config_data, config_model, log_f):
     }
     return dataset_pack
 
-# === 重构: 新增函数，用于处理合成数据 ===
+# === 修改: _load_synthetic_dataset ===
 def _load_synthetic_dataset(config, log_f):
     """
     加载/生成合成数据集。
@@ -91,9 +91,8 @@ def _load_synthetic_dataset(config, log_f):
     P, Q = config.data.input_len, config.data.output_len
     
     # 1. 
-    # #!#!#! 
     if config.synthetic.num_steps_after_burn_in < 1000: 
-        min_steps = 2000 # 
+        min_steps = 2000 
         log_string(log_f, f"Warning: num_steps_after_burn_in < 1000. Re-setting to {min_steps} steps for split.")
         config.synthetic.num_steps_after_burn_in = min_steps
 
@@ -128,8 +127,6 @@ def _load_synthetic_dataset(config, log_f):
     testX, testY = seq2instance(testData, P, Q)
     
     # 5. 
-    # 
-    #
     tod = config.model.tod_size
     dow = config.model.dow_size
     TE = np.zeros([num_step, 2])
@@ -141,12 +138,16 @@ def _load_synthetic_dataset(config, log_f):
     valXTE, _ = seq2instance(TE_tile[train_steps : train_steps + val_steps], P, Q)
     testXTE, _ = seq2instance(TE_tile[-test_steps :], P, Q)
     
-    # 6. 
-    mean, std = 0.0, 1.0 
+    mean, std = np.mean(trainX), np.std(trainX)
 
-    log_string(log_f, f'Shape of Train: {trainY.shape}')
-    log_string(log_f, f'Shape of Validation: {valY.shape}')
-    log_string(log_f, f'Shape of Test: {testY.shape}')
+    log_string(log_f, "Data shapes (Samples, Time, Nodes, Features):")
+    log_string(log_f, f'Shape of Train X (P={P}): {trainX.shape}')
+    log_string(log_f, f'Shape of Train Y (Q={Q}): {trainY.shape}')
+    log_string(log_f, f'Shape of Validation X (P={P}): {valX.shape}')
+    log_string(log_f, f'Shape of Validation Y (Q={Q}): {valY.shape}')
+    log_string(log_f, f'Shape of Test Y (P={P}): {testX.shape}')
+    log_string(log_f, f'Shape of Test Y (Q={Q}): {testY.shape}')
+    log_string(log_f, f'Mean (Train X): {mean} & Std (Train X): {std}')
 
     dataset_pack = {
         'data': {
@@ -154,14 +155,14 @@ def _load_synthetic_dataset(config, log_f):
             'valX': valX, 'valY': valY, 'valXTE': valXTE,
             'testX': testX, 'testY': testY, 'testXTE': testXTE,
         },
-        'stats': { 'mean': mean, 'std': std },
+        'stats': { 'mean': mean, 'std': std }, # 
         'locations': locations, 
         'n_nodes': num_nodes,
         'ground_truth_adj': ground_truth_adj
     }
     return dataset_pack
 
-# === 重构: 新增的主调度函数 ===
+# === 主调度函数 (无变化) ===
 def load_dataset(config, log_f):
     """
     根据配置加载数据集 (真实世界或合成)。

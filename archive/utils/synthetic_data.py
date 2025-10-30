@@ -1,5 +1,5 @@
 # STCP/utils/synthetic_data.py
-# (已修复 Lorenz burn-in 逻辑并重命名变量以提高清晰度)
+# (已修复: 移除了内部的归一化)
 
 import numpy as np
 from scipy.integrate import solve_ivp
@@ -36,29 +36,20 @@ def lorenz96(t, x, F):
         dxdt[i] = (x[(i + 1) % N] - x[(i - 2) % N]) * x[(i - 1) % N] - x[i] + F
     return dxdt
 
-# === 修改: generate_lorenz96 ===
+# === generate_lorenz96 ===
 def generate_lorenz96(n_nodes, num_steps_after_burn_in, num_steps_burn_in, F=10.0, delta_t=0.1, seed=0):
     """
     生成 Lorenz96 数据。
-    
-    Args:
-        n_nodes (int): 节点数
-        num_steps_after_burn_in (int): 
-        num_steps_burn_in (int): 
-        F (float): Lorenz 
-        delta_t (float): 
-        seed (int): 
     """
     np.random.seed(seed)
     
     # 
-    adj = np.zeros((n_nodes, n_nodes))
+    adj = np.eye(n_nodes, n_nodes)
     for i in range(n_nodes):
         adj[i, (i + 1) % n_nodes] = 1
         adj[i, (i - 1) % n_nodes] = 1
         adj[i, (i - 2) % n_nodes] = 1
     
-    # #!#!#! 逻辑修复与澄清
     # 
     total_steps = num_steps_after_burn_in + num_steps_burn_in
     t_total_time = total_steps * delta_t
@@ -73,14 +64,11 @@ def generate_lorenz96(n_nodes, num_steps_after_burn_in, num_steps_burn_in, F=10.
     data = sol.y.T # 
     
     # 
-    # 
     if data.shape[0] < total_steps:
-        # 
         print(f"Warning: solve_ivp returned {data.shape[0]} steps, expected {total_steps}. Using all available steps.")
-        # 
-        num_steps_burn_in = min(num_steps_burn_in, int(data.shape[0] * 0.2)) # 
+        num_steps_burn_in = min(num_steps_burn_in, int(data.shape[0] * 0.2)) 
     
-    # #!#!#! 这就是 burn-in 步骤，丢弃前面的点
+    # 
     data = data[num_steps_burn_in:, :]
     
     # 
@@ -88,7 +76,7 @@ def generate_lorenz96(n_nodes, num_steps_after_burn_in, num_steps_burn_in, F=10.
     
     return data, adj, locations
 
-# === 修改: var_stable (添加 burn-in) ===
+# === var_stable ===
 def var_stable(n_nodes, num_steps_after_burn_in, num_steps_burn_in, p, adj=None, noise_std=0.1, seed=0, spatial_layout='grid'):
     np.random.seed(seed)
     
@@ -118,7 +106,7 @@ def var_stable(n_nodes, num_steps_after_burn_in, num_steps_burn_in, p, adj=None,
     if max_eigval >= 1:
         A = A / (max_eigval + 0.1)
     
-    # #!#!#! 逻辑修复与澄清
+    # 
     total_steps = num_steps_after_burn_in + num_steps_burn_in
     
     data = np.zeros((total_steps + p, n_nodes)) # 
@@ -133,7 +121,6 @@ def var_stable(n_nodes, num_steps_after_burn_in, num_steps_burn_in, p, adj=None,
     # 
     locations = _generate_spatial_layout(n_nodes, spatial_layout)
     
-    # #!#!#! 执行 burn-in 
     # 
     data = data[p + num_steps_burn_in:, :]
             
@@ -145,7 +132,6 @@ def generate_synthetic_data(config, seed=0):
     生成合成数据的主函数
     """
     n_nodes = config.n_nodes
-    # #!#!#! 变量重命名
     num_steps_after_burn_in = config.num_steps_after_burn_in
     num_steps_burn_in = config.num_steps_burn_in
     
@@ -165,12 +151,6 @@ def generate_synthetic_data(config, seed=0):
         )
     else:
         raise ValueError(f"Unknown synthetic data type: {data_type}")
-
-    # 
-    data_mean = np.mean(data, axis=0)
-    data_std = np.std(data, axis=0)
-    data_std[data_std == 0] = 1.0
-    data = (data - data_mean) / data_std
 
     data = data[..., np.newaxis] 
     

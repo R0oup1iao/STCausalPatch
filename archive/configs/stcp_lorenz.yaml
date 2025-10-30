@@ -18,7 +18,7 @@ data:
 
 synthetic:
   data_type: "lorenz"
-  n_nodes: 20       
+  n_nodes: 128       
   num_steps_after_burn_in: 5000   
   num_steps_burn_in: 1000         
   var_p: 2          
@@ -26,7 +26,7 @@ synthetic:
 
 spatial:
   initial_depth: 1    
-  final_depth: 5      
+  final_depth: 7      
   schedule_type: "linear"
   
 model:
@@ -50,7 +50,7 @@ model:
 
 training:
   seed: 42
-  device: "cuda:0"
+  device: "cuda:1"
   batch_size: 64
   max_epoch: 100
   

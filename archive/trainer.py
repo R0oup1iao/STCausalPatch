@@ -1,6 +1,6 @@
 # STCP/trainer.py
-# (已修复 Bug 1: 数据归一化泄露)
-# (已修复 Bug 2: 将 null_val 传递给损失函数)
+# (已修复 Bug B: 强制自注意力)
+# (已修复 Bug B: 稀疏损失仅计算非对角线)
 
 import torch
 import torch.nn as nn
@@ -13,7 +13,7 @@ import random
 from sklearn.metrics import roc_auc_score, f1_score, precision_recall_curve, auc
 
 from utils.logging import log_string
-from utils.metrics import metric, masked_mae # 
+from utils.metrics import metric, masked_mae
 from utils.gumbel import gumbel_softmax
 
 class STCPTrainer:
@@ -31,7 +31,6 @@ class STCPTrainer:
         self.best_val_loss = float('inf')
         self.best_causal_f1 = 0.0 
         
-        #!#!#! 修复: 从配置中获取 null_val
         self.loss_null_val = config.training.get('loss_null_val', 0.0)
         if isinstance(self.loss_null_val, str) and self.loss_null_val.lower() == 'none':
             self.loss_null_val = None
@@ -132,7 +131,7 @@ class STCPTrainer:
         Y = Y_data[batch_indices]
         TE = TE_data[batch_indices]
         
-        #!#!#! 修复 Bug 1: X 和 Y 都需要归一化
+        # 
         X_norm = (X - self.stats['mean']) / self.stats['std']
         Y_norm = (Y - self.stats['mean']) / self.stats['std'] 
         
@@ -145,18 +144,25 @@ class STCPTrainer:
     def _run_data_pred_step(self, x_norm, y_norm, te):
         """
         执行一步数据预测 (模型拟合)。
-        #!#!#! 修复 Bug 1: 变量重命名为 x_norm, y_norm
         """
         self.model.train()
         self.data_pred_optimizer.zero_grad()
         
         # 
         Graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT)) # (N, N)
-        graph_sampled = torch.bernoulli(Graph).float().unsqueeze(0).expand(x_norm.shape[0], -1, -1)
+        
+        #!#!#! 修复 Bug B: 强制自注意力
+        N = Graph.shape[0]
+        identity = torch.eye(N, device=Graph.device)
+        # 
+        Graph_for_sampling = (Graph * (1 - identity)) + identity
+        
+        # 
+        graph_sampled = torch.bernoulli(Graph_for_sampling).float().unsqueeze(0).expand(x_norm.shape[0], -1, -1)
             
         y_pred = self.model(x_norm, te, graph_sampled) # (B, Q, N, 1)
         
-        #!#!#! 修复 Bug 1 & 2: 
+        # 
         loss = self.data_pred_loss(y_pred, y_norm, self.loss_null_val)
         
         loss.backward()
@@ -168,7 +174,6 @@ class STCPTrainer:
     def _run_graph_discov_step(self, x_norm, y_norm, te):
         """
         执行一步因果图发现。
-        #!#!#! 修复 Bug 1: 变量重命名为 x_norm, y_norm
         """
         self.model.train()
         self.graph_optimizer.zero_grad()
@@ -176,8 +181,14 @@ class STCPTrainer:
         GT_prob_sig = torch.sigmoid(self.GT)
         Graph = torch.einsum("nm,ml->nl", self.G, GT_prob_sig) # (N, N)
 
+        #!#!#! 修复 Bug B: 强制自注意力
+        N = Graph.shape[0]
+        identity = torch.eye(N, device=Graph.device)
         # 
-        Graph_logits = torch.stack([Graph, 1.0 - Graph], dim=-1)
+        Graph_for_sampling = (Graph * (1 - identity)) + identity
+
+        # 
+        Graph_logits = torch.stack([Graph_for_sampling, 1.0 - Graph_for_sampling], dim=-1)
         Graph_logits = torch.log(Graph_logits + 1e-20) # (N, N, 2)
         
         Graph_logits_expanded = Graph_logits.unsqueeze(0).expand(x_norm.shape[0], -1, -1, -1)
@@ -185,14 +196,14 @@ class STCPTrainer:
         # 
         graph_sampled = gumbel_softmax(Graph_logits_expanded, temperature=self.gumbel_tau, hard=True)[..., 0]
         
-        # 
-        loss_sparsity = torch.norm(Graph, 1) / (Graph.shape[0] * Graph.shape[1])
+        #!#!#! 修复 Bug B: 稀疏损失只应惩罚非对角线元素
+        loss_sparsity = torch.norm(Graph * (1 - identity), 1) / (N * N)
         
         # 
         with torch.no_grad(): # 
              y_pred = self.model(x_norm, te, graph_sampled)
         
-        #!#!#! 修复 Bug 1 & 2: 
+        # 
         loss_data = self.data_pred_loss(y_pred, y_norm, self.loss_null_val)
         
         # 
@@ -245,11 +256,17 @@ class STCPTrainer:
             train_l_sum_data, train_l_sum_graph, train_l_sum_sparse = 0.0, 0.0, 0.0
             
             for batch_idx in range(num_batch):
-                #!#!#! 修复 Bug 1: 变量重命名
+                # 
                 x_norm, y_norm, te = self._get_batch(trainX, trainY, trainXTE, permutation, batch_idx)
                 
                 # 
                 loss_data_step = self._run_data_pred_step(x_norm, y_norm, te)
+                
+                # 
+                if torch.isnan(torch.tensor(loss_data_step)):
+                    log_string(self.log, f"Epoch {epoch} Batch {batch_idx}: Data loss is NaN. Stopping graph step.")
+                    continue # 
+                
                 loss_graph_step, loss_g_data, loss_g_sparse = self._run_graph_discov_step(x_norm, y_norm, te)
                 
                 train_l_sum_data += loss_data_step
@@ -301,18 +318,23 @@ class STCPTrainer:
         with torch.no_grad():
             Graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT))
             
+            #!#!#! 修复 Bug B: 
+            N = Graph.shape[0]
+            identity = torch.eye(N, device=Graph.device)
+            Graph_for_eval = (Graph * (1 - identity)) + identity
+            
             pred_all, label_all = [], []
 
             for batch_idx in range(num_batch):
-                #!#!#! 修复 Bug 1: 
+                # 
                 x_norm, y_norm, te = self._get_batch(valX, valY, valXTE, np.arange(num_val), batch_idx)
                 
                 B, T, N, _ = x_norm.shape
-                graph_expanded = Graph.unsqueeze(0).expand(B, -1, -1)
+                graph_expanded = Graph_for_eval.unsqueeze(0).expand(B, -1, -1) # 
                 
                 y_pred_norm = self.model(x_norm, te, graph_expanded) # (B, Q, N, 1)
                 
-                #!#!#! 修复 Bug 1: 
+                # 
                 pred_denorm = y_pred_norm.cpu().numpy() * self.stats['std'] + self.stats['mean']
                 label_denorm = y_norm.cpu().numpy() * self.stats['std'] + self.stats['mean']
                 
@@ -324,7 +346,7 @@ class STCPTrainer:
         
         maes, rmses, mapes = [], [], []
         for i in range(self.config.data.output_len):
-            #!#!#! 修复 Bug 2: 
+            # 
             mae, rmse , mape = metric(pred[:,i,:,0], label[:,i,:,0], self.loss_null_val)
             maes.append(mae)
         
@@ -347,14 +369,19 @@ class STCPTrainer:
         with torch.no_grad():
             Graph = torch.einsum("nm,ml->nl", self.G, torch.sigmoid(self.GT))
             
+            #!#!#! 修复 Bug B: 
+            N = Graph.shape[0]
+            identity = torch.eye(N, device=Graph.device)
+            Graph_for_eval = (Graph * (1 - identity)) + identity
+            
             pred_all, label_all = [], []
 
             for batch_idx in range(num_batch):
-                #!#!#! 修复 Bug 1: 
+                # 
                 x_norm, y_norm, te = self._get_batch(testX, testY, testXTE, np.arange(num_test), batch_idx)
                 
                 B, T, N, _ = x_norm.shape
-                graph_expanded = Graph.unsqueeze(0).expand(B, -1, -1)
+                graph_expanded = Graph_for_eval.unsqueeze(0).expand(B, -1, -1) # 
                 y_pred_norm = self.model(x_norm, te, graph_expanded)
                 
                 pred_denorm = y_pred_norm.cpu().numpy() * self.stats['std'] + self.stats['mean']
@@ -369,12 +396,12 @@ class STCPTrainer:
         log_string(self.log, "--- Test Results (Prediction) ---")
         maes, rmses, mapes = [], [], []
         for i in range(self.config.data.output_len):
-            #!#!#! 修复 Bug 2: 
+            # 
             mae, rmse , mape = metric(pred[:,i,:,0], label[:,i,:,0], self.loss_null_val)
             maes.append(mae); rmses.append(rmse); mapes.append(mape)
             log_string(self.log,'step %d, mae: %.4f, rmse: %.4f, mape: %.4f' % (i+1, mae, rmse, mape))
         
-        #!#!#! 修复 Bug 2: 
+        # 
         mae, rmse, mape = metric(pred[...,0], label[...,0], self.loss_null_val)
         log_string(self.log, 'average, mae: %.4f, rmse: %.4f, mape: %.4f' % (mae, rmse, mape))
         
