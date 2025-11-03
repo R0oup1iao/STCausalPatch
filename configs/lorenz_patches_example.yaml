@@ -58,7 +58,7 @@ sota:
       model: multi_lstm
       pred_step: 1
       mlp_hid: 32
-      gru_layers: 1
+      gru_layers: 1  # 注意：现在使用的是现代 MLP，此参数表示 MLP 层的数量
       shared_weights_decoder: false
       concat_h: true
       lr_data_start: 1e-2
