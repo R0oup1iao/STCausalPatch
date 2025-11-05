@@ -29,14 +29,9 @@ class CUTSPlusLightning(pl.LightningModule):
     
     核心改动:
     1.  **LR Warmup**: 为两个优化器添加了 10-epoch 线性 warmup。
-    2.  **消除缓冲区**: 使用预分配张量 (self.epoch_data_pred) 替代 .append() 和 torch.cat()，
-        极大简化了 fill_policy 逻辑。
-    3.  **责任分离**: 
-        - `training_step` 拆分为 `_model_prediction_step` 和 `_graph_discovery_step`。
-        - `on_train_epoch_end` 拆分为 `_update_schedulers_and_annealing`, 
-          `_apply_fill_policy_and_log_mse`, 和 `_log_plots_and_metrics`。
-    4.  **移除 _TBWrapper**: 在 `_log_plots_and_metrics` 中直接使用 sklearn 计算 AUC 和绘制 ROC，
-        移除了丑陋的内联包装类。
+    2.  **消除缓冲区**: 使用预分配张量 (self.epoch_data_pred) 替代 .append() 和 torch.cat()。
+    3.  **移除 _TBWrapper**: 在 _log_plots_and_metrics 中直接使用 sklearn。
+    4.  **模型切换**: __init__ 默认加载 CUTS_Plus_Transformer_Net, 可手动切换。
     """
     def __init__(self, train_config, reproduc_config):
         super().__init__()
@@ -51,15 +46,40 @@ class CUTSPlusLightning(pl.LightningModule):
         self.causal_logits = None # [G, N], 可训练参数
         self.current_n_groups = self.config.n_groups
 
+        # -----------------------------------------------------------------
+        # --- 关键修改：手动模型切换 ---
+        # -----------------------------------------------------------------
         # 2. 初始化模型和损失
+        
+        # 从配置中获取模型参数
+        pred_config = self.config.data_pred
+        
+        # 通用模型参数
+        model_params = {
+            "n_nodes": self.config.n_nodes,
+            "in_ch": self.config.data_dim,
+            "hidden_ch": pred_config.mlp_hid,
+            "shared_weights_decoder": pred_config.shared_weights_decoder,
+        }
+
+        # --- 默认加载 Transformer (新架构) ---
+        # print(f"Initializing CUTS_Plus_Transformer_Net (Hidden: {pred_config.mlp_hid})")
+        # self.model = CUTS_Plus_Transformer_Net(
+        #     **model_params,
+        #     n_heads=getattr(pred_config, 'n_heads', 4),
+        #     transformer_layers=getattr(pred_config, 'transformer_layers', 2),
+        #     dropout=getattr(pred_config, 'dropout', 0.0)
+        # )
+        
+        # --- 如需切换回原版, 请注释掉上面, 并取消注释下面这行 ---
+        print(f"Initializing CUTS_Plus_Net (Original) (Hidden: {pred_config.mlp_hid})")
         self.model = CUTS_Plus_Net(
-            n_nodes=self.config.n_nodes,
-            in_ch=self.config.data_dim,
-            n_layers=self.config.data_pred.gru_layers, 
-            hidden_ch=self.config.data_pred.mlp_hid,
-            shared_weights_decoder=self.config.data_pred.shared_weights_decoder,
-            concat_h=self.config.data_pred.concat_h,
+            **model_params,
+            n_layers=pred_config.gru_layers,
+            concat_h=pred_config.concat_h
         )
+        # -----------------------------------------------------------------
+
         self.pred_loss = nn.MSELoss()
 
         # 3. 初始化 Annealing 参数
@@ -74,24 +94,19 @@ class CUTSPlusLightning(pl.LightningModule):
         self.current_lambda_s = start_lmd
 
         # 4. 设置为手动优化
-        # 因为 group_policy 需要重置 graph_optimizer，所以必须手动
         self.automatic_optimization = False
 
         # 5. 用于 fill_policy 的预分配张量 (替代缓冲区)
-        # 我们将在 on_train_epoch_start 中初始化它们
-        self.epoch_data_pred = None # 存储 y_filled
-        self.epoch_data_pred_all = None # 存储 y_pred (用于日志)
-        self.data_interp_buffer = None # 存储插值前的数据 (用于日志)
+        self.epoch_data_pred = None
+        self.epoch_data_pred_all = None
+        self.data_interp_buffer = None
 
     # --------------------------------------------------------------------------
     # 辅助函数 (初始化)
     # --------------------------------------------------------------------------
 
     def _initialize_graph_params(self):
-        """
-        (重)初始化群组矩阵 (G) 和 因果 logits (GT)。
-        不再负责创建优化器。
-        """
+        """ (重)初始化群组矩阵 (G) 和 因果 logits (GT)。 """
         n_nodes = self.config.n_nodes
         
         # 1. 创建 group_matrix (原 G)
@@ -122,20 +137,15 @@ class CUTSPlusLightning(pl.LightningModule):
         self.causal_logits = nn.Parameter(GT_init.to(self.device))
         
     def _initialize_graph_optimizer(self, start_epoch=0):
-        """
-        (重)创建 Graph Optimizer，并快进到指定 epoch。
-        包含 10-epoch warmup 逻辑。
-        """
+        """ (重)创建 Graph Optimizer，并快进到指定 epoch。 """
         total_epochs = self.config.total_epoch
         decay_epochs = total_epochs - self.warmup_epochs
         if decay_epochs <= 0: decay_epochs = 1 # 避免除以零
 
-        # 计算衰减率
         gamma = (self.config.graph_discov.lr_graph_end / self.config.graph_discov.lr_graph_start) ** (1 / decay_epochs)
         
         self.opt_graph = torch.optim.Adam([self.causal_logits], lr=self.config.graph_discov.lr_graph_start)
         
-        # 定义 Warmup 和 Decay 调度器
         warmup_sched = torch.optim.lr_scheduler.LinearLR(
             self.opt_graph, start_factor=1e-6, end_factor=1.0, total_iters=self.warmup_epochs
         )
@@ -143,20 +153,12 @@ class CUTSPlusLightning(pl.LightningModule):
             self.opt_graph, step_size=1, gamma=gamma
         )
         
-        # 链接两个调度器
         self.sched_graph = torch.optim.lr_scheduler.SequentialLR(
             self.opt_graph, schedulers=[warmup_sched, decay_sched], milestones=[self.warmup_epochs]
         )
         
-        # 快进调度器到 start_epoch
-        # Note: SequentialLR 的 step() 必须在 optimizer.step() 之后调用，
-        # 但这里我们只是为了初始化 LR，所以空 step 即可。
-        # (在 on_train_epoch_end 中我们会正确地 step)
         current_lr = self.sched_graph.get_last_lr()[0]
         if start_epoch > 0:
-            # Pytorch 2.x+ 推荐在 optimizer.step() 之后 step() scheduler。
-            # 为了“快进”，我们模拟这个过程。
-            # 但对于 LinearLR/StepLR，只调用 .step() 也能更新 LR。
             for _ in range(start_epoch):
                 self.sched_graph.step()
             current_lr = self.sched_graph.get_last_lr()[0]
@@ -168,36 +170,34 @@ class CUTSPlusLightning(pl.LightningModule):
     # --------------------------------------------------------------------------
 
     def configure_optimizers(self):
-        # 1. 配置模型优化器 (opt_model)
-        opt_model = torch.optim.Adam(
+        opt_model = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.config.data_pred.lr_data_start,
             weight_decay=self.config.data_pred.weight_decay
         )
         
-        # 2. 配置模型调度器 (sched_model)
         if "every" in self.config.fill_policy:
             lr_schedule_length = int(self.config.fill_policy.split("_")[-1])
         else:
             lr_schedule_length = self.config.total_epoch
-            
+
         decay_epochs = lr_schedule_length - self.warmup_epochs
         if decay_epochs <= 0: decay_epochs = 1
-
+        
         gamma = (self.config.data_pred.lr_data_end / self.config.data_pred.lr_data_start) ** (1 / decay_epochs)
-
+        
         warmup_sched = torch.optim.lr_scheduler.LinearLR(
-            opt_model, start_factor=1e-6, end_factor=1.0, total_iters=self.warmup_epochs
+           opt_model, start_factor=1e-6, end_factor=1.0, total_iters=self.warmup_epochs
         )
         decay_sched = torch.optim.lr_scheduler.StepLR(
             opt_model, step_size=1, gamma=gamma
         )
         
-        scheduler = torch.optim.lr_scheduler.SequentialLR(
+        self.sched_model = torch.optim.lr_scheduler.SequentialLR(
             opt_model, schedulers=[warmup_sched, decay_sched], milestones=[self.warmup_epochs]
         )
         
-        return [opt_model], [{"scheduler": scheduler, "interval": "epoch"}]
+        return [opt_model]
 
     # --------------------------------------------------------------------------
     # 辅助函数 (因果图)
@@ -205,7 +205,6 @@ class CUTSPlusLightning(pl.LightningModule):
 
     def get_causal_graph_prob(self):
         """ 辅助函数：计算最终的因果图概率 (原 Graph) """
-        # G [N, G], GT [G, N] -> Graph [N, N]
         G = self.group_matrix.to(self.device)
         GT_prob = torch.sigmoid(self.causal_logits)
         return torch.einsum("nm,ml->nl", G, GT_prob)
@@ -241,7 +240,6 @@ class CUTSPlusLightning(pl.LightningModule):
                 self._initialize_graph_optimizer(start_epoch=self.current_epoch)
         
         elif self.current_epoch == 0:
-            # group_policy == None，但仍需在 epoch 0 初始化
             self._initialize_graph_params()
             self._initialize_graph_optimizer(start_epoch=0)
 
@@ -254,12 +252,9 @@ class CUTSPlusLightning(pl.LightningModule):
                 self.log("params/tau_reset", self.current_tau, on_step=False, on_epoch=True)
                 
         # 3. 预分配张量 (替代缓冲区)
-        # clone() 很重要，否则会修改原始数据
         data_shape = dm.train_data.shape
         self.epoch_data_pred = torch.zeros_like(dm.train_data, device='cpu', dtype=torch.float32)
         self.epoch_data_pred_all = torch.zeros_like(dm.train_data, device='cpu', dtype=torch.float32)
-        
-        # 4. 存储用于插值的 data 副本 (用于 epoch end 日志)
         self.data_interp_buffer = dm.train_data.clone().cpu()
 
     # --------------------------------------------------------------------------
@@ -274,11 +269,13 @@ class CUTSPlusLightning(pl.LightningModule):
         x, y, t, mask_x, mask_y = batch
         bs = x.shape[0]
         
-        # 使用 detach 的图进行预测
         graph_prob_detached = self.get_causal_graph_prob().detach()
         graph_sampled_pred = torch.bernoulli(graph_prob_detached.unsqueeze(0).expand(bs, -1, -1)).float()
         
+        # --- 接口更新 ---
+        # 两个模型现在都接受 (x, mask_x, graph)
         y_pred = self.model(x, mask_x, graph_sampled_pred)
+        # --------------
         
         loss_pred = self.pred_loss(y * mask_y, y_pred * mask_y) / torch.mean(mask_y)
         
@@ -287,7 +284,6 @@ class CUTSPlusLightning(pl.LightningModule):
         
         self.log("train/pred_loss", loss_pred, on_step=True, on_epoch=True, prog_bar=True)
 
-        # 返回需要写入缓冲区的值
         return y_pred.detach(), y.detach(), t.detach()
 
     def _graph_discovery_step(self, batch):
@@ -298,11 +294,13 @@ class CUTSPlusLightning(pl.LightningModule):
         x, y, t, mask_x, mask_y = batch
         bs = x.shape[0]
 
-        # 使用带梯度的图
         graph_prob = self.get_causal_graph_prob() 
         graph_sampled_disc = self.gumbel_sigmoid_sample(graph_prob, bs, self.current_tau)
         
+        # --- 接口更新 ---
+        # 两个模型现在都接受 (x, mask_x, graph)
         y_pred_disc = self.model(x, mask_x, graph_sampled_disc)
+        # --------------
         
         loss_data = self.pred_loss(y * mask_y, y_pred_disc * mask_y) / torch.mean(mask_y)
         loss_sparsity = torch.linalg.norm(graph_prob.flatten(), ord=1) / (graph_prob.shape[0] * graph_prob.shape[1])
@@ -313,7 +311,7 @@ class CUTSPlusLightning(pl.LightningModule):
         self.opt_graph.step()
 
         self.log("train/graph_data_loss", loss_data, on_step=True, on_epoch=True)
-        self.log("train/graph_sparsity_loss", loss_sparsity, on_step=True, on_epoch=True, prog_bar=True)
+        self.log("train/graph_sparsity_loss", loss_sparsity, on_step=True, on_epoch=True)
         self.log("train/graph_total_loss", loss_graph, on_step=True, on_epoch=True)
 
     def training_step(self, batch, batch_idx):
@@ -326,18 +324,15 @@ class CUTSPlusLightning(pl.LightningModule):
         self._graph_discovery_step(batch)
 
         # --- 步骤 3: 写入预分配张量 (替代缓冲区) ---
-        # 假设 T_pred = 1 (config.pred_step)
         if y_pred.shape[2] != 1:
-             print(f"Warning: pred_step is {y_pred.shape[2]}, fill_policy might be incorrect.")
+                 print(f"Warning: pred_step is {y_pred.shape[2]}, fill_policy might be incorrect.")
 
         y_filled = y_pred * (1 - mask_y) + y_true * mask_y
         
-        # 确保 squeeze(2) 是安全的
         y_filled_squeezed = y_filled.squeeze(2).cpu().float()
         y_pred_squeezed = y_pred.squeeze(2).cpu().float()
         t_cpu = t_indices.cpu()
 
-        # 直接写入，无需 append
         self.epoch_data_pred[t_cpu] = y_filled_squeezed
         self.epoch_data_pred_all[t_cpu] = y_pred_squeezed
 
@@ -347,16 +342,14 @@ class CUTSPlusLightning(pl.LightningModule):
 
     def _update_schedulers_and_annealing(self):
         """ 辅助函数: 更新所有调度器和退火参数 """
-        # 1. 更新 Schedulers (手动)
-        sched_model = self.lr_schedulers()
+        sched_model = self.sched_model
+
         sched_model.step()
         self.sched_graph.step()
-        
-        # 2. 更新 Annealing 参数
+
         self.current_tau *= self.gumbel_tau_gamma
         self.current_lambda_s *= self.lambda_gamma
-        
-        # 3. 日志
+
         self.log("params/tau", self.current_tau, on_step=False, on_epoch=True)
         self.log("params/lambda_s", self.current_lambda_s, on_step=False, on_epoch=True)
         self.log("params/lr_model", sched_model.get_last_lr()[0], on_step=False, on_epoch=True)
@@ -367,11 +360,8 @@ class CUTSPlusLightning(pl.LightningModule):
         """ 辅助函数: 应用 fill_policy 并记录 MSE """
         dm = self.trainer.datamodule
         
-        # 1. 将预分配的张量 (已填充) 应用回 DataModule
-        # self.epoch_data_pred 已经在 training_step 中被填充完毕
         dm.update_data(self.epoch_data_pred, self.current_epoch)
         
-        # 2. 计算 MSE (现在简单多了)
         mse_pred_to_original = self.pred_loss(
             dm.original_data.to(self.device), 
             self.epoch_data_pred.to(self.device)
@@ -387,7 +377,6 @@ class CUTSPlusLightning(pl.LightningModule):
     def _log_plots_and_metrics(self):
         """ 辅助函数: 绘制所有图像并计算 AUC (替代 _TBWrapper) """
         
-        # 0. 获取 Logger 和 DataModule
         logger = self.logger.experiment
         dm = self.trainer.datamodule
         
@@ -397,21 +386,30 @@ class CUTSPlusLightning(pl.LightningModule):
         # 1. 绘制时序图
         avg_mask = dm.observ_mask.cpu().numpy().mean(axis=(0, 2))
         time_series_idx = np.argmin(avg_mask) if np.min(avg_mask) < 1 else 0
-        
+
+        # --- 使用你提供的、已修复的绘图代码 ---
         try:
-            fig_ts = log_time_series(
-                dm.original_data.cpu()[-100:, time_series_idx], 
-                self.data_interp_buffer.cpu()[-100:, time_series_idx], 
-                self.epoch_data_pred_all.cpu()[-100:, time_series_idx]
-            )
+            original = dm.original_data.cpu()[-100:, time_series_idx]
+            interp = self.data_interp_buffer.cpu()[-100:, time_series_idx]
+            pred = self.epoch_data_pred_all.cpu()[-100:, time_series_idx]
+
+            fig_ts, ax = plt.subplots(figsize=(15, 5))
+            ax.plot(original, label='Original Data', color='blue')
+            ax.plot(interp, label='Interpolated (Input)', color='orange', linestyle='--')
+            ax.plot(pred, label='Model Prediction (y_pred)', color='green', linestyle=':')
+            ax.set_title(f"Time Series Comparison (Node {time_series_idx})")
+            ax.set_xlabel("Time Step (last 100)")
+            ax.set_ylabel("Value")
+            ax.legend()
             logger.add_figure("Time Series Comparison", fig_ts, global_step=self.current_epoch)
         except Exception as e:
             print(f"Warning: Failed to log time series plot. {e}")
-            plt.close('all') # 清理 matplotlib 状态
+            plt.close('all')
+        # -----------------------------------
 
         # 2. 绘制因果图矩阵
         n = Graph_np.shape[0]
-        figsize = [max(1.5 * n, 10), max(1.0 * n, 10)] # 保证最小尺寸
+        figsize = [max(1.5 * n, 10), max(1.0 * n, 10)]
         
         matrix_map = {
             "Group Matrix (G)": self.group_matrix.detach().cpu().numpy(),
@@ -427,21 +425,16 @@ class CUTSPlusLightning(pl.LightningModule):
                 logger.add_figure(name, fig, global_step=self.current_epoch)
             except Exception as e:
                 print(f"Warning: Failed to log matrix '{name}'. {e}")
-                plt.close('all') # 清理 matplotlib 状态
+                plt.close('all')
 
-        # 3. 计算和绘制 AUC/ROC (替代 _TBWrapper 和 calc_and_log_metrics)
+        # 3. 计算和绘制 AUC/ROC
         if true_cm is not None:
-            # 原版仓库计算 AUC 时转置了 Graph，我们遵循这个逻辑
-            # Graph [N, N] (target, source)
-            # true_cm [N, N] (source, target)
             Graph_transposed = rearrange(Graph_np, "n m -> m n")
             
             try:
-                # 3.1. 计算 AUC
                 auc = roc_auc_score(true_cm.flatten(), Graph_transposed.flatten())
-                self.log("metrics/auc", auc, on_step=False, on_epoch=True, prog_bar=True)
+                self.log("auc", auc, on_step=False, on_epoch=True, prog_bar=True)
 
-                # 3.2. 绘制 ROC 曲线
                 fpr, tpr, _ = roc_curve(true_cm.flatten(), Graph_transposed.flatten())
                 fig_roc, ax = plt.subplots()
                 ax.plot(fpr, tpr, label=f"AUC = {auc:.4f}")
@@ -451,12 +444,10 @@ class CUTSPlusLightning(pl.LightningModule):
                 ax.set_title("ROC Curve")
                 ax.legend()
                 logger.add_figure("ROC Curve", fig_roc, global_step=self.current_epoch)
-            
             except Exception as e:
                 print(f"Warning: Failed to calculate or log AUC/ROC. {e}")
-                plt.close('all') # 清理 matplotlib 状态
+                plt.close('all')
 
-            # 3.3. 保存 npz (可选，模仿原版 calc_and_log_metrics)
             try:
                 save_dir = self.trainer.log_dir
                 if save_dir:
@@ -470,13 +461,9 @@ class CUTSPlusLightning(pl.LightningModule):
 
 
     def on_train_epoch_end(self):
-        # 1. 更新调度器和退火参数
         self._update_schedulers_and_annealing()
-        
-        # 2. 应用 fill_policy 并记录 MSE
         self._apply_fill_policy_and_log_mse()
         
-        # 3. 绘图和计算指标
         if (self.current_epoch + 1) % self.config.show_graph_every == 0:
             self._log_plots_and_metrics()
 
@@ -488,8 +475,6 @@ class CUTSPlusLightning(pl.LightningModule):
         """ 在训练结束时导出最终因果图。"""
         try:
             graph_np = self.get_causal_graph_prob().detach().cpu().numpy()
-            
-            # 使用 self.trainer.log_dir 获取正确的日志目录
             log_dir = self.trainer.log_dir
             
             if log_dir is not None:
@@ -498,8 +483,7 @@ class CUTSPlusLightning(pl.LightningModule):
                 np.save(save_path, graph_np)
                 print(f"Saved final causal graph to {save_path}")
             else:
-                 np.save("Graph_final.npy", graph_np)
-                 print("Warning: Logger log_dir not found. Saved final graph to Graph_final.npy")
-
+                np.save("Graph_final.npy", graph_np)
+                print("Warning: Logger log_dir not found. Saved final graph to Graph_final.npy")
         except Exception as e:
             print(f"Warning: failed to save final Graph_final.npy due to: {e}")

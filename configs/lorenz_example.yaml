@@ -36,8 +36,8 @@ reproduc:
 sota:
   cuts_plus:
     n_nodes: auto
-    input_step: 1
-    batch_size: 128
+    input_step: 10
+    batch_size: 32
     data_dim: 1
     total_epoch: 64
 
@@ -59,6 +59,10 @@ sota:
       lr_data_end: 1e-3
       weight_decay: 0
       prob: true
+
+      n_heads: 4
+      transformer_layers: 2
+      dropout: 0.0
 
     graph_discov:
       lambda_s_start: 1e-1
